@@ -96,25 +96,6 @@ class MemoryKeeper:
             full = "..." + full[full.index("\n"):]
         return full
 
-    def check_consistency(self, new_text: str) -> List[str]:
-        """Basic contradiction check against known facts."""
-        issues = []
-        # Simple keyword-based check for now
-        # In production, this would use the LLM to check
-        for f in self.facts[-20:]:
-            fact_lower = f["fact"].lower()
-            text_lower = new_text.lower()
-            # Check for "died" contradiction
-            if "died" in fact_lower or "dead" in fact_lower:
-                # Extract character name (very basic)
-                for char_id, char in self.world.characters.items():
-                    name_lower = char["name"].lower()
-                    if name_lower in fact_lower and name_lower in text_lower:
-                        if any(word in text_lower for word in ["said", "spoke", "walked", "ran", "laughed", "cried"]):
-                            if "ghost" not in text_lower and "memory" not in text_lower:
-                                issues.append(f"Possible contradiction: {char['name']} was established as dead")
-        return issues
-
     def to_dict(self) -> Dict:
         return {
             "summaries": self.summaries,
