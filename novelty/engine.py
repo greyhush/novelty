@@ -10,6 +10,7 @@ from novelty.memory import MemoryKeeper
 from novelty.llm import LLMClient
 from novelty.agents import WorldBuilder, CharacterActor, Narrator
 from novelty.router import Router
+from novelty.checker import ConsistencyChecker
 
 
 class GameEngine:
@@ -20,6 +21,7 @@ class GameEngine:
         self.world = WorldState()
         self.memory = MemoryKeeper(self.world)
         self.router = Router(self.world)
+        self.checker = ConsistencyChecker(self.world, self.memory)
 
         # Agents
         self.world_builder = WorldBuilder(llm)
@@ -37,6 +39,7 @@ class GameEngine:
         self.world = self.world_builder.generate_world(genre, description, player_name)
         self.memory = MemoryKeeper(self.world)
         self.router = Router(self.world)
+        self.checker = ConsistencyChecker(self.world, self.memory)
 
         self.memory.record_event(
             f"A new story begins: {self.world.title}. {self.world.synopsis}",
@@ -62,6 +65,8 @@ class GameEngine:
             response = self._handle_meta(text)
 
         elif routed["type"] == "dialogue":
+            # Consistency check on player input
+            check = self.checker.check_player_input(text)
             # Record player dialogue
             speaker = routed.get("speaker", "player")
             char_name = self.world.characters.get(speaker, {}).get("name", speaker)
@@ -71,22 +76,24 @@ class GameEngine:
                 characters=[speaker],
                 importance=5,
             )
-            # Generate NPC responses
-            response = self._handle_dialogue(routed)
+            # Generate NPC responses (with consistency check)
+            response = self._handle_dialogue(routed, check)
 
         elif routed["type"] == "narration":
             # Player is writing as author
+            check = self.checker.check_player_input(text)
             self.memory.record_event(
                 text, event_type="player_input", importance=6,
             )
-            response = self._handle_narration(routed)
+            response = self._handle_narration(routed, check)
 
         elif routed["type"] == "action":
             # Player character action
+            check = self.checker.check_player_input(text)
             self.memory.record_event(
                 text, event_type="player_input", importance=5,
             )
-            response = self._handle_action(routed)
+            response = self._handle_action(routed, check)
 
         self.last_response = response
         return response
@@ -135,9 +142,31 @@ class GameEngine:
             {"role": "user", "content": text},
         ], temperature=0.7, max_tokens=300)
 
-    def _handle_dialogue(self, routed: Dict) -> str:
-        """Generate NPC responses to dialogue."""
+    def _handle_dialogue(self, routed: Dict, check: Dict = None) -> str:
+        """Generate NPC responses to dialogue, with consistency checking."""
         responses = []
+
+        # If there are high-severity issues, have the narrator address them first
+        if check and not check["valid"]:
+            high_issues = [i for i in check.get("issues", []) if i.get("severity") == "high"]
+            if high_issues:
+                # Inject consistency handling into the scene
+                issue_desc = "; ".join(i["detail"] for i in high_issues)
+                suggestion = check.get("suggestion", "")
+                # Narrator acknowledges the anomaly gracefully
+                anomaly = self.narrator.narrate(
+                    world_ctx=self._build_world_context(),
+                    memory_ctx=self.memory.get_full_context(2000),
+                    player_input=f"[CONSISTENCY ALERT] The player just said/did something contradictory: {issue_desc}. "
+                                 f"Handle this gracefully in the narrative. Options: {suggestion}. "
+                                 f"DO NOT break immersion. Work it into the story naturally.",
+                    scene_summary=self._build_scene_context(routed.get("target_characters", [])),
+                )
+                responses.append(anomaly)
+                self.memory.record_event(
+                    f"[Anomaly] {issue_desc} — handled as: {anomaly[:100]}",
+                    event_type="narrative", importance=7,
+                )
 
         # Build scene context
         scene_ctx = self._build_scene_context(routed.get("target_characters", []))
@@ -151,6 +180,19 @@ class GameEngine:
                     scene_context=scene_ctx,
                     recent_dialogue=self.memory.get_recent_context(5),
                 )
+
+                # Check NPC output for consistency
+                output_check = self.checker.check_agent_output(response, "character")
+                if not output_check["valid"]:
+                    # Retry with consistency instructions
+                    issues = "; ".join(i["detail"] for i in output_check["issues"])
+                    response = self.character_actor.act(
+                        character=char,
+                        scene_context=scene_ctx + f"\n\n[IMPORTANT: {issues}]",
+                        recent_dialogue=self.memory.get_recent_context(5),
+                        direction=f"You must stay consistent. {issues}",
+                    )
+
                 responses.append(f'**{char["name"]}:** {response}')
                 self.memory.record_event(
                     f'{char["name"]}: {response}',
@@ -160,7 +202,7 @@ class GameEngine:
                 )
 
         # If no specific NPCs targeted, have the narrator respond
-        if not responses:
+        if not responses or (len(responses) == 1 and check and not check["valid"]):
             narration = self.narrator.narrate(
                 world_ctx=self._build_world_context(),
                 memory_ctx=self.memory.get_full_context(),
@@ -171,8 +213,25 @@ class GameEngine:
 
         return "\n\n".join(responses)
 
-    def _handle_narration(self, routed: Dict) -> str:
+    def _handle_narration(self, routed: Dict, check: Dict = None) -> str:
         """Player is writing as author - acknowledge and add NPC reactions."""
+        # If there are issues, have the narrator handle them
+        prefix = ""
+        if check and not check["valid"]:
+            high_issues = [i for i in check.get("issues", []) if i.get("severity") == "high"]
+            if high_issues:
+                issue_desc = "; ".join(i["detail"] for i in high_issues)
+                suggestion = check.get("suggestion", "")
+                prefix = self.narrator.narrate(
+                    world_ctx=self._build_world_context(),
+                    memory_ctx=self.memory.get_full_context(2000),
+                    player_input=f"[CONSISTENCY ALERT] {issue_desc}. Handle gracefully. Options: {suggestion}",
+                )
+                self.memory.record_event(
+                    f"[Anomaly] {issue_desc} — {prefix[:100]}",
+                    event_type="narrative", importance=7,
+                )
+
         # The player's narration IS the narrative. We just add NPC responses.
         scene_ctx = self._build_scene_context(routed.get("target_characters", []))
 
@@ -187,9 +246,24 @@ class GameEngine:
                     recent_dialogue=self.memory.get_recent_context(3),
                     direction="React naturally to what just happened.",
                 )
+
+                # Check NPC output
+                output_check = self.checker.check_agent_output(response, "character")
+                if not output_check["valid"]:
+                    issues = "; ".join(i["detail"] for i in output_check["issues"])
+                    response = self.character_actor.act(
+                        character=char,
+                        scene_context=scene_ctx + f"\n\n[IMPORTANT: {issues}]",
+                        recent_dialogue=self.memory.get_recent_context(3),
+                        direction=f"Stay consistent. {issues}",
+                    )
+
                 npc_responses.append(f'**{char["name"]}:** {response}')
 
-        result = f"*{routed['content']}*\n"
+        result = ""
+        if prefix:
+            result += f"{prefix}\n\n"
+        result += f"*{routed['content']}*\n"
         if npc_responses:
             result += "\n\n" + "\n\n".join(npc_responses)
         else:
@@ -203,8 +277,25 @@ class GameEngine:
 
         return result
 
-    def _handle_action(self, routed: Dict) -> str:
-        """Handle player character action."""
+    def _handle_action(self, routed: Dict, check: Dict = None) -> str:
+        """Handle player character action with consistency checking."""
+        # If there are high-severity issues, address them first
+        prefix = ""
+        if check and not check["valid"]:
+            high_issues = [i for i in check.get("issues", []) if i.get("severity") == "high"]
+            if high_issues:
+                issue_desc = "; ".join(i["detail"] for i in high_issues)
+                suggestion = check.get("suggestion", "")
+                prefix = self.narrator.narrate(
+                    world_ctx=self._build_world_context(),
+                    memory_ctx=self.memory.get_full_context(2000),
+                    player_input=f"[CONSISTENCY ALERT] {issue_desc}. Handle gracefully in the narrative. Options: {suggestion}",
+                )
+                self.memory.record_event(
+                    f"[Anomaly] {issue_desc} — {prefix[:100]}",
+                    event_type="narrative", importance=7,
+                )
+
         narration = self.narrator.narrate(
             world_ctx=self._build_world_context(),
             memory_ctx=self.memory.get_full_context(),
@@ -221,6 +312,7 @@ class GameEngine:
             if player:
                 player_loc = player.get("location")
 
+        npc_parts = []
         if player_loc:
             for cid, char in self.world.characters.items():
                 if cid != player_id and char.get("location") == player_loc and char["state"] == "active":
@@ -233,9 +325,28 @@ class GameEngine:
                             recent_dialogue=narration[:300],
                             direction="React to what the player character just did.",
                         )
-                        narration += f"\n\n**{char['name']}:** {response}"
 
-        return narration
+                        # Check NPC output
+                        output_check = self.checker.check_agent_output(response, "character")
+                        if not output_check["valid"]:
+                            issues = "; ".join(i["detail"] for i in output_check["issues"])
+                            response = self.character_actor.act(
+                                character=char,
+                                scene_context=self._build_scene_context([cid]) + f"\n\n[IMPORTANT: {issues}]",
+                                recent_dialogue=narration[:300],
+                                direction=f"Stay consistent. {issues}",
+                            )
+
+                        npc_parts.append(f'**{char["name"]}:** {response}')
+
+        result = ""
+        if prefix:
+            result += f"{prefix}\n\n"
+        result += narration
+        if npc_parts:
+            result += "\n\n" + "\n\n".join(npc_parts)
+
+        return result
 
     # ── Scene building ───────────────────────────────────────────────────
 
@@ -328,6 +439,7 @@ class GameEngine:
         self.world = WorldState.from_dict(data["world"])
         self.memory = MemoryKeeper.from_dict(data["memory"], self.world)
         self.router = Router(self.world)
+        self.checker = ConsistencyChecker(self.world, self.memory)
 
         return f"Game loaded: {name}\n\n{self._format_world_intro()}"
 
